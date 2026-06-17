@@ -3,7 +3,8 @@
 
 请在分享或使用前替换以下配置：
 - TEST_EMAIL / TEST_PASSWORD
-- TEST_INBOX_API
+- TEST_INBOX_API（Inbucket 或 cloudflare_temp_email 基址）
+- TEST_MAIL_JWT / TEST_CF_ADMIN_PASSWORD / TEST_EMAIL_DOMAIN（CF 邮箱）
 
 依赖：
 - curl_cffi
@@ -49,10 +50,43 @@ def load_dotenv(dotenv_path: str = None) -> None:
 
 load_dotenv()
 
-s = curl_requests.Session(impersonate='chrome136')
+
+def resolve_impersonate() -> str:
+    """根据已安装的 curl_cffi 版本选择可用的浏览器指纹。"""
+    preferred = os.getenv('CURL_IMPERSONATE', 'chrome136').strip() or 'chrome136'
+    try:
+        from curl_cffi.requests import BrowserType
+
+        supported = {item.value for item in BrowserType}
+        if preferred in supported:
+            return preferred
+        for fallback in ('chrome136', 'chrome124', 'chrome120', 'chrome116', 'chrome110'):
+            if fallback in supported:
+                if fallback != preferred:
+                    print(f'  curl_cffi 不支持 {preferred}，回退到 {fallback}')
+                return fallback
+    except Exception:
+        pass
+    return preferred
+
+
+def resolve_user_agent(impersonate: str) -> str:
+    """生成与 impersonate 版本大致匹配的 User-Agent。"""
+    version = '136'
+    match = re.search(r'chrome(\d+)', impersonate)
+    if match:
+        version = match.group(1)
+    return (
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+        f'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version}.0.0.0 Safari/537.36'
+    )
+
+
+IMPERSONATE = resolve_impersonate()
+UA = resolve_user_agent(IMPERSONATE)
+s = curl_requests.Session(impersonate=IMPERSONATE)
 s.trust_env = False
 s.proxies = {'https': '', 'http': ''}
-UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/136.0.0.0 Safari/537.36'
 
 def h(r='https://chatgpt.com/'):
     return {'Accept': 'application/json', 'Referer': r, 'Origin': 'https://chatgpt.com', 'User-Agent': UA}
@@ -60,9 +94,170 @@ def h(r='https://chatgpt.com/'):
 def b64url(b):
     return base64.urlsafe_b64encode(b).decode().rstrip('=')
 
+
+def normalize_inbox_base_url(url: str) -> str:
+    """将收件 API 地址规范为服务根 URL（去掉末尾 /api/v1 等路径）。"""
+    base = (url or '').strip().rstrip('/')
+    for suffix in ('/api/v1', '/api'):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    return base.rstrip('/')
+
+
+def extract_otp_from_content(*parts: str) -> str:
+    """从邮件正文或 HTML 片段中提取 6 位数字 OTP。"""
+    for content in parts:
+        if not content:
+            continue
+        match = re.search(r'(\d{6})', content)
+        if match:
+            return match.group(1)
+    return ''
+
+
+def provision_cf_mailbox(
+    session,
+    base_url: str,
+    admin_password: str,
+    *,
+    local_part: str = '',
+    domain: str = '',
+) -> tuple[str, str]:
+    """通过 cloudflare_temp_email 管理员接口创建邮箱，返回 (address, jwt)。"""
+    name = local_part or ('codex' + secrets.token_hex(4))
+    mail_domain = domain or os.getenv('TEST_EMAIL_DOMAIN', '').strip()
+    if not mail_domain:
+        raise ValueError('缺少 TEST_EMAIL_DOMAIN，无法自动创建 CF 邮箱')
+
+    api = normalize_inbox_base_url(base_url)
+    payload = {'name': name, 'domain': mail_domain}
+    response = session.post(
+        f'{api}/admin/new_address',
+        headers={
+            'x-admin-auth': admin_password,
+            'Content-Type': 'application/json',
+        },
+        json=payload,
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f'创建 CF 邮箱失败: HTTP {response.status_code} {response.text[:300]}'
+        )
+    data = response.json()
+    address = str(data.get('address', '') or '').strip()
+    jwt = str(data.get('jwt', '') or '').strip()
+    if not address or not jwt:
+        raise RuntimeError(f'创建 CF 邮箱响应异常: {data}')
+    return address, jwt
+
+
+def wait_otp_from_inbucket(session, inbox_api: str, email: str, attempts: int = 30) -> str:
+    """轮询 Inbucket 风格 /api/v1/mailbox 接口，直到拿到 OTP。"""
+    mailbox = email.split('@')[0]
+    for i in range(attempts):
+        time.sleep(2)
+        list_resp = session.get(f'{inbox_api}/mailbox/{mailbox}', timeout=10)
+        if list_resp.status_code != 200:
+            if i % 5 == 0:
+                print(f'  wait... ({i + 1}/{attempts})')
+            continue
+        messages = list_resp.json()
+        if not messages:
+            if i % 5 == 0:
+                print(f'  wait... ({i + 1}/{attempts})')
+            continue
+        message_id = messages[-1].get('id', '')
+        if not message_id:
+            continue
+        detail_resp = session.get(
+            f'{inbox_api}/mailbox/{mailbox}/{message_id}',
+            timeout=10,
+        )
+        if detail_resp.status_code != 200:
+            continue
+        body_text = (detail_resp.json().get('body', {}) or {}).get('text', '') or ''
+        otp = extract_otp_from_content(body_text)
+        if otp:
+            return otp
+        if i % 5 == 0:
+            print(f'  wait... ({i + 1}/{attempts})')
+    return ''
+
+
+def wait_otp_from_cf_inbox(session, base_url: str, jwt: str, attempts: int = 30) -> str:
+    """轮询 cloudflare_temp_email /api/parsed_mails 接口，直到拿到 OTP。"""
+    api = normalize_inbox_base_url(base_url)
+    headers = {'Authorization': f'Bearer {jwt}'}
+    for i in range(attempts):
+        time.sleep(2)
+        response = session.get(
+            f'{api}/api/parsed_mails',
+            params={'limit': 10, 'offset': 0},
+            headers=headers,
+            timeout=10,
+        )
+        if response.status_code != 200:
+            if i % 5 == 0:
+                print(f'  wait... ({i + 1}/{attempts})')
+            continue
+        results = (response.json() or {}).get('results', []) or []
+        for mail in reversed(results):
+            otp = extract_otp_from_content(
+                mail.get('text', '') or '',
+                mail.get('html', '') or '',
+            )
+            if otp:
+                return otp
+        if i % 5 == 0:
+            print(f'  wait... ({i + 1}/{attempts})')
+    return ''
+
+
+def resolve_mail_config(session) -> tuple[str, str, str]:
+    """解析收件配置，必要时自动创建 CF 邮箱，返回 (mode, inbox_api, mail_jwt)。"""
+    inbox_raw = os.getenv('TEST_INBOX_API', 'http://your-mailbox-service.example/api/v1')
+    inbox_mode = os.getenv('TEST_INBOX_MODE', '').strip().lower()
+    mail_jwt = os.getenv('TEST_MAIL_JWT', '').strip()
+    admin_password = os.getenv('TEST_CF_ADMIN_PASSWORD', '').strip()
+    email = os.getenv('TEST_EMAIL', '').strip()
+    email_domain = os.getenv('TEST_EMAIL_DOMAIN', '').strip()
+
+    if not inbox_mode:
+        inbox_mode = 'cf' if mail_jwt or admin_password else 'inbucket'
+
+    if inbox_mode == 'cf':
+        base_url = normalize_inbox_base_url(inbox_raw)
+        if not mail_jwt and admin_password:
+            local_part = email.split('@')[0] if email and '@' in email else ''
+            domain = email.split('@')[1] if email and '@' in email else email_domain
+            print('[0] 自动创建 CF 临时邮箱...')
+            address, mail_jwt = provision_cf_mailbox(
+                session,
+                base_url,
+                admin_password,
+                local_part=local_part,
+                domain=domain,
+            )
+            os.environ['TEST_EMAIL'] = address
+            os.environ['TEST_MAIL_JWT'] = mail_jwt
+            print(f'  address: {address}')
+        if not mail_jwt:
+            raise RuntimeError(
+                'CF 邮箱模式需要 TEST_MAIL_JWT，或提供 TEST_CF_ADMIN_PASSWORD 以自动创建邮箱'
+            )
+        return 'cf', base_url, mail_jwt
+
+    api_v1 = inbox_raw.rstrip('/')
+    if not api_v1.endswith('/api/v1'):
+        api_v1 = normalize_inbox_base_url(inbox_raw) + '/api/v1'
+    return 'inbucket', api_v1, ''
+
+
+INBOX_MODE, INBOX_API, MAIL_JWT = resolve_mail_config(s)
 EMAIL = os.getenv('TEST_EMAIL', 'your-test-email@example.com')
 PASSWORD = os.getenv('TEST_PASSWORD', 'your-password')
-INBOX_API = os.getenv('TEST_INBOX_API', 'http://your-mailbox-service.example/api/v1')
 
 CID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 CRI = 'http://localhost:1455/auth/callback'
@@ -140,26 +335,14 @@ else:
            headers={**h('https://auth.openai.com/email-verification'), 'Content-Type': 'application/json'}, timeout=30)
 
 print('[4] Wait OTP...')
-otp = ''
-mb = EMAIL.split('@')[0]
-for i in range(30):
-    time.sleep(2)
-    r2 = s.get(f'{INBOX_API}/mailbox/' + mb, timeout=10)
-    if r2.status_code == 200:
-        ms = r2.json()
-        if ms:
-            mid = ms[-1].get('id', '')
-            if mid:
-                r3 = s.get(f'{INBOX_API}/mailbox/' + mb + '/' + mid, timeout=10)
-                if r3.status_code == 200:
-                    body = (r3.json().get('body', {}) or {}).get('text', '') or ''
-                    m = re.search(r'(\d{6})', body)
-                    if m:
-                        otp = m.group(1)
-                        print('  OTP: ' + otp)
-                        break
-    if i % 5 == 0:
-        print('  wait... (' + str(i+1) + '/30)')
+if INBOX_MODE == 'cf':
+    print('  inbox: cloudflare_temp_email')
+    otp = wait_otp_from_cf_inbox(s, INBOX_API, MAIL_JWT)
+else:
+    print('  inbox: inbucket')
+    otp = wait_otp_from_inbucket(s, INBOX_API, EMAIL)
+if otp:
+    print('  OTP: ' + otp)
 if not otp:
     print('  NO OTP!')
     sys.exit(1)

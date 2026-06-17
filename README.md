@@ -21,8 +21,10 @@
 
 ```bash
 python3 -m pip install --upgrade pip
-pip install curl_cffi
+pip install -r requirements.txt
 ```
+
+macOS 12 (Monterey) 若 `curl_cffi` 报 `_SCDynamicStoreCopyProxies` 错误，请使用 `requirements.txt` 里固定的 `0.7.4` 版本，不要直接装最新版。
 
 如果要走 QuickJS 路径，还需要系统可用 `node`：
 
@@ -40,9 +42,21 @@ cp .env.example .env
 
 编辑 `.env`，将以下变量替换为真实值：
 
-- `TEST_EMAIL`
-- `TEST_PASSWORD`
-- `TEST_INBOX_API`  inbuck 邮箱地址
+- `TEST_PASSWORD`：OpenAI 注册密码
+- `TEST_INBOX_API`：收件服务根地址（不要带 `/api/v1`）
+
+**方式 A：Cloudflare 临时邮箱（cloudflare_temp_email）**
+
+- `TEST_EMAIL_DOMAIN`：收信域名，例如 `edu.myfe.xyz`
+- `TEST_CF_ADMIN_PASSWORD`：Worker 管理员密码（用于自动创建邮箱）
+- `TEST_MAIL_JWT`：可选；若已有邮箱 JWT 可填，否则留空由脚本自动创建
+- `TEST_EMAIL`：可选；留空则自动随机创建，或填写指定前缀如 `codex001@edu.myfe.xyz`
+
+**方式 B：自建 Inbucket**
+
+- `TEST_INBOX_MODE=inbucket`
+- `TEST_INBOX_API`：例如 `http://127.0.0.1:9000/api/v1`
+- `TEST_EMAIL`：完整邮箱地址
 
 `CLIENT_ID` 和 `CODEX_REDIRECT_URI` 已固定在脚本中，无需在 `.env` 中配置。
 
@@ -58,7 +72,7 @@ python3 codex_team_oauth.py
 
 - 该脚本仅用于示例和测试，切勿分享 `.env` 中的真实凭据。
 - 不要附带 `/tmp/codex_token_*.json` 或其他敏感输出文件。
-- `TEST_INBOX_API` 需要指向可用的 OTP 邮件服务接口。
+- `TEST_INBOX_API` 需要指向可用的 OTP 邮件服务接口（支持 Inbucket 或 cloudflare_temp_email）。
 
 ## 友情链接
 
