@@ -1,2 +1,2 @@
-# macOS 12 (Monterey) 需固定 0.7.x；0.15+ 预编译包要求 macOS 13+
-curl_cffi==0.7.4
+# macOS 12 可用 0.13.0（支持 chrome136）；0.15+ 在 Monterey 可能无法导入
+curl_cffi==0.13.0

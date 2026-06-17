@@ -24,7 +24,9 @@ python3 -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-macOS 12 (Monterey) 若 `curl_cffi` 报 `_SCDynamicStoreCopyProxies` 错误，请使用 `requirements.txt` 里固定的 `0.7.4` 版本，不要直接装最新版。
+macOS 12 (Monterey) 若 `curl_cffi` 报 `_SCDynamicStoreCopyProxies` 错误，请使用 `requirements.txt` 里固定的版本，不要直接装最新版。
+
+访问 `auth.openai.com` 若返回 403 `Just a moment...`，是 Cloudflare 拦截，需要**代理**（见下方 `HTTPS_PROXY`），与 `CLIENT_ID` 无关。
 
 如果要走 QuickJS 路径，还需要系统可用 `node`：
 
@@ -52,13 +54,33 @@ cp .env.example .env
 - `TEST_MAIL_JWT`：可选；若已有邮箱 JWT 可填，否则留空由脚本自动创建
 - `TEST_EMAIL`：可选；留空则自动随机创建，或填写指定前缀如 `codex001@edu.myfe.xyz`
 
+**网络（403 时必填）**
+
+- `HTTPS_PROXY` 或 `HTTP_PROXY`：访问 OpenAI 的代理，例如 `http://127.0.0.1:7890`
+
+**OAuth（一般不用改）**
+
+- `CLIENT_ID`：默认 `app_EMoamEEZ73f0CkXaXp7hrann`（Codex CLI 官方 ID，用于拿 token）
+- `CODEX_REDIRECT_URI`：默认 `http://localhost:1455/auth/callback`
+
 **方式 B：自建 Inbucket**
 
 - `TEST_INBOX_MODE=inbucket`
 - `TEST_INBOX_API`：例如 `http://127.0.0.1:9000/api/v1`
 - `TEST_EMAIL`：完整邮箱地址
 
-`CLIENT_ID` 和 `CODEX_REDIRECT_URI` 已固定在脚本中，无需在 `.env` 中配置。
+## Team 跳手机注册流程
+
+1. 开一个带 Codex 席位的 Team 空间（约 $0.52 积分空间即可）。
+2. 在 Team 后台绑定你的域名（如 `edu.myfe.xyz`），**不要**开启「自动创建账号」。
+3. 该域名配置好收信（CF 临时邮箱或 Inbucket 均可）。
+4. `.env` 里 `TEST_EMAIL_DOMAIN` 必须与 Team 绑定的域名一致。
+5. 运行脚本，用 `@你的Team域名` 邮箱注册；Team 域名邮箱可跳过手机号验证。
+6. `CLIENT_ID` 保持默认即可，**不需要**换成别的；跳手机靠的是第 4、5 步的域名，不是换 client_id。
+
+空间被封后，已绑定的域名有时仍可用于注册，以实际测试为准。
+
+`CLIENT_ID` 和 `CODEX_REDIRECT_URI` 已支持通过 `.env` 覆盖，默认无需修改。
 
 ## 运行方式
 

@@ -86,7 +86,20 @@ IMPERSONATE = resolve_impersonate()
 UA = resolve_user_agent(IMPERSONATE)
 s = curl_requests.Session(impersonate=IMPERSONATE)
 s.trust_env = False
-s.proxies = {'https': '', 'http': ''}
+
+def resolve_proxies() -> dict:
+    """从环境变量读取 HTTP/HTTPS 代理；留空则直连。"""
+    proxy = (
+        os.getenv('HTTPS_PROXY', '').strip()
+        or os.getenv('HTTP_PROXY', '').strip()
+        or os.getenv('ALL_PROXY', '').strip()
+    )
+    if proxy:
+        print(f'  使用代理: {proxy}')
+        return {'http': proxy, 'https': proxy}
+    return {'https': '', 'http': ''}
+
+s.proxies = resolve_proxies()
 
 def h(r='https://chatgpt.com/'):
     return {'Accept': 'application/json', 'Referer': r, 'Origin': 'https://chatgpt.com', 'User-Agent': UA}
@@ -105,15 +118,52 @@ def normalize_inbox_base_url(url: str) -> str:
     return base.rstrip('/')
 
 
+def is_plausible_otp(code: str) -> bool:
+    """过滤像年份拼接的 6 位误匹配（如 202123）。"""
+    if len(code) != 6 or not code.isdigit():
+        return False
+    year_prefix = int(code[:4])
+    if 1990 <= year_prefix <= 2035:
+        return False
+    return True
+
+
 def extract_otp_from_content(*parts: str) -> str:
     """从邮件正文或 HTML 片段中提取 6 位数字 OTP。"""
+    patterns = [
+        r'(?:verification|verify|security)\s*code[^\d]{0,40}(\d{6})',
+        r'(?:code|OTP|otp)[:\s]+(\d{6})',
+        r'(\d{6})\s+is your(?: ChatGPT)?(?: verification)? code',
+        r'>\s*(\d{6})\s*<',
+        r'(?<!\d)(\d{6})(?!\d)',
+    ]
     for content in parts:
         if not content:
             continue
-        match = re.search(r'(\d{6})', content)
-        if match:
-            return match.group(1)
+        for pattern in patterns:
+            for match in re.finditer(pattern, content, re.IGNORECASE):
+                code = match.group(1)
+                if is_plausible_otp(code):
+                    return code
     return ''
+
+
+def extract_otp_from_mail(mail: dict) -> str:
+    """从 cloudflare_temp_email 解析后的邮件对象中提取 OTP。"""
+    return extract_otp_from_content(
+        mail.get('text', '') or '',
+        mail.get('html', '') or '',
+        mail.get('subject', '') or '',
+    )
+
+
+def is_openai_mail(mail: dict) -> bool:
+    """判断邮件是否可能来自 OpenAI 验证码。"""
+    sender = str(mail.get('source') or mail.get('from') or '').lower()
+    subject = str(mail.get('subject') or '').lower()
+    if 'openai' in sender or 'chatgpt' in sender or 'oaistatic' in sender:
+        return True
+    return any(k in subject for k in ('verification', 'verify', 'code', 'chatgpt'))
 
 
 def provision_cf_mailbox(
@@ -204,10 +254,13 @@ def wait_otp_from_cf_inbox(session, base_url: str, jwt: str, attempts: int = 30)
             continue
         results = (response.json() or {}).get('results', []) or []
         for mail in reversed(results):
-            otp = extract_otp_from_content(
-                mail.get('text', '') or '',
-                mail.get('html', '') or '',
-            )
+            if not is_openai_mail(mail):
+                continue
+            otp = extract_otp_from_mail(mail)
+            if otp:
+                return otp
+        for mail in reversed(results):
+            otp = extract_otp_from_mail(mail)
             if otp:
                 return otp
         if i % 5 == 0:
@@ -259,8 +312,9 @@ INBOX_MODE, INBOX_API, MAIL_JWT = resolve_mail_config(s)
 EMAIL = os.getenv('TEST_EMAIL', 'your-test-email@example.com')
 PASSWORD = os.getenv('TEST_PASSWORD', 'your-password')
 
-CID = 'app_EMoamEEZ73f0CkXaXp7hrann'
-CRI = 'http://localhost:1455/auth/callback'
+# Codex CLI 官方 client_id；Team 跳手机靠的是注册邮箱域名，不是换 client_id
+CID = os.getenv('CLIENT_ID', 'app_EMoamEEZ73f0CkXaXp7hrann')
+CRI = os.getenv('CODEX_REDIRECT_URI', 'http://localhost:1455/auth/callback')
 STATE = b64url(secrets.token_bytes(24))
 
 print('Email: ' + EMAIL + '\n')
@@ -327,7 +381,12 @@ if is_new:
                json={'password': PASSWORD, 'username': EMAIL}, timeout=30)
     print('  user/register: ' + str(r.status_code))
     if r.status_code == 200:
-        s.get('https://auth.openai.com/api/accounts/email-otp/send', headers=h('https://auth.openai.com/create-account/password'), timeout=30)
+        s.post(
+            'https://auth.openai.com/api/accounts/email-otp/send',
+            headers={**h('https://auth.openai.com/create-account/password'), 'Content-Type': 'application/json'},
+            json={},
+            timeout=30,
+        )
         print('  send_otp sent')
 else:
     print('[3] OTP path...')
@@ -348,12 +407,35 @@ if not otp:
     sys.exit(1)
 
 print('[5] Verify OTP...')
-r = s.post('https://auth.openai.com/api/accounts/email-otp/validate',
-           headers={**h('https://auth.openai.com/email-verification'), 'Content-Type': 'application/json'},
-           json={'code': otp}, timeout=30)
-if r.status_code == 200:
-    cu = r.json().get('continue_url', '') or ''
-    print('  continue_url: ' + cu[:120])
+s.get('https://auth.openai.com/email-verification', headers=h('https://auth.openai.com/create-account/password'), timeout=15)
+snt_otp = get_sentinel_token(s, device_id=did, flow='authorize_continue')
+r = s.post(
+    'https://auth.openai.com/api/accounts/email-otp/validate',
+    headers={
+        **h('https://auth.openai.com/email-verification'),
+        'Content-Type': 'application/json',
+        'openai-sentinel-token': snt_otp,
+    },
+    json={'code': otp},
+    timeout=30,
+)
+print('  validate: ' + str(r.status_code))
+if r.status_code != 200:
+    print('  FAIL: ' + r.text[:500])
+    sys.exit(1)
+otp_data = r.json()
+cu = str(otp_data.get('continue_url', '') or '')
+page_type = ''
+if isinstance(otp_data.get('page'), dict):
+    page_type = str(otp_data['page'].get('type', '') or '')
+print('  page_type: ' + (page_type or 'NONE'))
+print('  continue_url: ' + cu[:120])
+if cu.startswith('/'):
+    cu = urljoin('https://auth.openai.com', cu)
+if cu:
+    s.get(cu, headers=h('https://auth.openai.com/email-verification'), timeout=15, allow_redirects=True)
+else:
+    s.get('https://auth.openai.com/about-you', headers=h('https://auth.openai.com/email-verification'), timeout=15)
 
 print('[6] create_account...')
 snt3 = get_sentinel_token(s, device_id=did, flow='create_account')
